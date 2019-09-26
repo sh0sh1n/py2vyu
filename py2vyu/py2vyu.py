@@ -1,30 +1,38 @@
+from __future__ import print_function
+import future
 import zipfile
 import re
 import pandas as pd
-import logging as log
 import numbers
 from math import floor
+import builtins
+import past
+import six
+import tempfile
+import os
+
+
+_line_formats = {
+    "column": re.compile(r"(?P<colname>\w+)\s\(.*\)\-(?P<codes>.*)"),
+    "cell": re.compile(
+        r"(?P<onset>\d{2}\:\d{2}\:\d{2}\:\d{3}),"
+        r"(?P<offset>\d{2}\:\d{2}\:\d{2}\:\d{3}),"
+        r"\((?P<values>.*)\)"
+    ),
+}
+
+
+def _parse_line(line):
+    for key, rx in _line_formats.items():
+        match = rx.search(line)
+        if match:
+            return key, match
+
+    return None, None
 
 
 def load_opf(filename):
     """Extract data from a .opf file and return a Spreadsheet"""
-
-    line_formats = {
-        "column": re.compile(r"(?P<colname>\w+)\s\(.*\)\-(?P<codes>.*)"),
-        "cell": re.compile(
-            r"(?P<onset>\d{2}\:\d{2}\:\d{2}\:\d{3}),"
-            r"(?P<offset>\d{2}\:\d{2}\:\d{2}\:\d{3}),"
-            r"\((?P<values>.*)\)"
-        ),
-    }
-
-    def _parse_line(line):
-        for key, rx in line_formats.items():
-            match = rx.search(line)
-            if match:
-                return key, match
-
-        return None, None
 
     with zipfile.ZipFile(filename, "r") as zf:
         assert "db" in zf.namelist()
@@ -42,14 +50,9 @@ def load_opf(filename):
                 line_type, match = _parse_line(line_stripped)
                 if line_type == "column":
                     codes = [x.split("|")[0] for x in match.group("codes").split(",")]
-                    log.debug(f"Stripped line: {line_stripped}\n")
 
                     # Create new column
                     col = sheet.new_column(match.group("colname"), *codes)
-                    log.debug(
-                        f"Created column {col.name} with code(s): %s\n",
-                        ", ".join(col.codelist),
-                    )
 
                     ordinal_counter = 1
 
@@ -59,13 +62,34 @@ def load_opf(filename):
                         ordinal=ordinal_counter,
                         onset=to_millis(match.group("onset")),
                         offset=to_millis(match.group("offset")),
-                        *values,
+                        *values
                     )
                     ordinal_counter += 1
-                    log.debug(f"New cell: {cell}\n")
-                else:
-                    log.warning("Can't parse line %d: %s\n", line_num, line_stripped)
     return sheet
+
+
+def save_opf(sheet, filename, *columns):
+    """
+    Save sheet to file. For existing zip files, need to recreate the whole thing.
+    See: https://stackoverflow.com/questions/25738523
+    """
+
+    tmpfd, tmpname = tempfile.mkstemp(dir=os.path.dirname(filename))
+    os.close(tmpfd)
+
+    # make copy
+    with zipfile.ZipFile(filename, "r") as zfin:
+        with zipfile.ZipFile(tmpname, "w") as zfout:
+            zfout.comment = zfin.comment
+            for item in zfin.infolist():
+                if item.filename != "db":
+                    zfout.writestr(item, zfin.read(item.filename))
+
+    os.remove(filename)
+    os.rename(tmpname, filename)
+
+    with zipfile.ZipFile(filename, mode="a") as zf:
+        zf.writestr("db", "#4\n" + sheet._to_opfdb(columns=columns))
 
 
 class Spreadsheet:
@@ -83,7 +107,7 @@ class Spreadsheet:
         return ncol
 
     def get_column_list(self):
-        return [*self.columns]
+        return self.columns.keys()
 
     def get_column(self, name):
         return self.columns[name]
@@ -94,7 +118,7 @@ class Spreadsheet:
             for col in column_names
         ]
 
-    def merge_columns(self, name, *columns, prune=True):
+    def merge_columns(self, name, prune=True, *columns):
         """
         Merge cells of the given columns into a new column.
 
@@ -109,7 +133,7 @@ class Spreadsheet:
 
         # Construct new column using column names and codes to make the code list.
         codes = [
-            f"{col.name}_{codename}"
+            col.name + "_" + codename
             for col in cols
             for codename in (["ordinal"] + col.codelist)
         ]
@@ -136,7 +160,6 @@ class Spreadsheet:
         times = sorted(
             set(unique_times + [x + 1 for x in point_times])
         )  # this should put a time 1 ms after each of the point times
-        log.debug(times)
 
         # Iterate over each interval and generate row of values for that interval
         ordinal = 1
@@ -153,7 +176,7 @@ class Spreadsheet:
                     if onset != offset and cell.onset == cell.offset:
                         continue
                     for code in ["ordinal"] + col.codelist:
-                        ncell.change_code(f"{col.name}_{code}", cell.get_code(code))
+                        ncell.change_code(col.name + "_" + code, cell.get_code(code))
                     valid_cells += 1
             ordinal += 1
             prev_time = offset + 1
@@ -172,7 +195,6 @@ class Spreadsheet:
             columns = self.columns.values()
 
         merge_col = self.merge_columns("temp", *columns)
-        log.debug(merge_col)
 
         variable_list = ["ordinal", "onset", "offset"] + merge_col.codelist
         data = [cell.get_values(intrinsics=True) for cell in merge_col.sorted_cells()]
@@ -198,6 +220,10 @@ class Spreadsheet:
 
         return [col.cell_at(time) for col in cols]
 
+    def _to_opfdb(self, columns=columns.keys()):
+        """Converts to .opf compatible string."""
+        return "\n".join([self.columns[col]._to_opfdb() for col in columns])
+
 
 class Column:
     """Representation of a Datavyu coding pass."""
@@ -218,7 +244,7 @@ class Column:
             c.change_code(code, value)
 
         # Insert '' for undefined codes
-        for code in self.codelist - c.values.keys():
+        for code in [x for x in self.codelist if not x in c.values.keys()]:
             c.change_code(code, "")
 
         self.cells.append(c)
@@ -245,12 +271,25 @@ class Column:
 
     def __repr__(self):
         return (
-            f"{self.name}("
+            self.name
+            + "("
             + ",".join(self.codelist)
             + "):\n["
             + "\n".join(map(str, self.sorted_cells()))
             + "]"
         )
+
+    def _to_opfdb(self):
+        """Converts to .opf compatible string."""
+
+        header = (
+            self.name
+            + " (MATRIX,false,)-"
+            + ",".join([str(c) + "|NOMINAL" for c in self.codelist])
+        )
+        lst = [c._to_opfdb() for c in self.cells]
+        lst.insert(0, header)
+        return "\n".join(lst)
 
 
 class Cell:
@@ -265,8 +304,14 @@ class Cell:
 
     def __repr__(self):
         return (
-            f"{self.parent.name}({self.ordinal},"
-            + f"{to_timestamp(self.onset)}-{to_timestamp(self.offset)},"
+            self.parent.name
+            + "("
+            + str(self.ordinal)
+            + ","
+            + to_timestamp(self.onset)
+            + "-"
+            + to_timestamp(self.offset)
+            + ","
             + ",".join(map(str, self.get_values()))
             + ")"
         )
@@ -281,7 +326,7 @@ class Cell:
         elif code in self.values.keys():
             self.values[code] = value
         else:
-            raise Exception(f"Cell does not have code: {code}")
+            raise Exception("Cell does not have code: " + code)
 
     def get_code(self, code):
         if code == "ordinal":
@@ -293,7 +338,7 @@ class Cell:
         elif code in self.values.keys():
             return self.values[code]
         else:
-            raise Exception(f"Cell does not contain code: {code}")
+            raise Exception("Cell does not contain code: " + code)
 
     def set_values(self, *values):
         for code, value in zip(self.parent.codelist, values):
@@ -328,6 +373,17 @@ class Cell:
     def ordinal(self):
         return self._ordinal
 
+    def _to_opfdb(self):
+        return (
+            to_timestamp(self.onset)
+            + ","
+            + to_timestamp(self.offset)
+            + ","
+            + "("
+            + ",".join([v for v in self.get_values()])
+            + ")"
+        )
+
 
 def to_millis(timestamp):
     if isinstance(timestamp, numbers.Number):
@@ -339,7 +395,6 @@ def to_millis(timestamp):
         ms *= factor
         ms += int(part)
 
-    log.debug(f"{timestamp} converted to: {ms}")
     return ms
 
 
@@ -352,6 +407,5 @@ def to_timestamp(millis):
         ms = floor(ms / factor)
     parts.reverse()
 
-    ts = "{:02d}:{:02d}:{:02d}:{:03d}".format(*parts)
-    log.debug(f"{millis} converted to: {ts}")
+    ts = "{:02.0f}:{:02.0f}:{:02.0f}:{:03.0f}".format(*parts)
     return ts
